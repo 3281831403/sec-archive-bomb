@@ -8,6 +8,7 @@ large files on disk.
 
 Data model
 ----------
+
 An archive is described in memory as::
 
     {"entries": [entry, ...]}
@@ -31,6 +32,9 @@ limit is accepted, and a value over a limit is rejected.
 
 from __future__ import annotations
 
+import ntpath
+import os
+
 __all__ = [
     "inspect",
     "ratio_check",
@@ -41,6 +45,27 @@ __all__ = [
     "validate_policy",
     "archive_batch",
 ]
+
+_DEFAULT_MAX_ENTRIES = 1000
+_DEFAULT_MAX_NAME_LENGTH = 255
+
+
+def _size(value: object, field: str) -> int:
+    """Return an exact non-negative byte count, rejecting malformed sizes."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"malformed {field}: {value!r}")
+    return value
+
+
+def _nested_depth(entry: dict) -> int:
+    """Return the full recursive nested-archive depth below one entry."""
+    nested = entry.get("nested")
+    if nested is None:
+        return 0
+    children = nested.get("entries") or []
+    if not children:
+        return 1
+    return 1 + max(_nested_depth(child) for child in children)
 
 
 def inspect(archive: dict) -> dict:
@@ -72,7 +97,55 @@ def inspect(archive: dict) -> dict:
 
     This function performs no extraction and no filesystem writes.
     """
-    raise NotImplementedError
+    entries: list[dict] = []
+    size_mismatches: list[str] = []
+    total_size = 0
+    total_declared_size = 0
+    total_compressed = 0
+    max_depth = 0
+
+    def walk(container: dict, depth: int) -> None:
+        nonlocal max_depth, total_size, total_declared_size, total_compressed
+        for entry in container.get("entries") or []:
+            declared = _size(entry.get("declared_size"), "declared_size")
+            compressed = _size(entry.get("compressed_size"), "compressed_size")
+            actual = entry.get("actual_size")
+            if actual is not None:
+                actual = _size(actual, "actual_size")
+                if actual != declared:
+                    size_mismatches.append(entry.get("name"))
+            effective = actual if actual is not None else declared
+
+            entries.append(
+                {
+                    "name": entry.get("name"),
+                    "size": effective,
+                    "declared_size": declared,
+                    "compressed_size": compressed,
+                    "depth": depth,
+                }
+            )
+            total_size += effective
+            total_declared_size += declared
+            total_compressed += compressed
+            if depth > max_depth:
+                max_depth = depth
+
+            nested = entry.get("nested")
+            if nested is not None:
+                walk(nested, depth + 1)
+
+    walk(archive, 0)
+
+    return {
+        "entries": entries,
+        "entry_count": len(entries),
+        "total_size": total_size,
+        "total_declared_size": total_declared_size,
+        "total_compressed": total_compressed,
+        "max_depth": max_depth,
+        "size_mismatches": size_mismatches,
+    }
 
 
 def ratio_check(total_size: int, total_compressed: int, ratio: float) -> bool:
@@ -88,7 +161,15 @@ def ratio_check(total_size: int, total_compressed: int, ratio: float) -> bool:
     - An empty archive (both totals zero) passes.
     - Tolerance is 0: no epsilon, rounding, or additive slack is permitted.
     """
-    raise NotImplementedError
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+        return False
+    if ratio <= 0:
+        return False
+    if total_size < 0 or total_compressed < 0:
+        return False
+    if total_size > 0 and total_compressed == 0:
+        return False
+    return total_size <= total_compressed * ratio
 
 
 def budget_check(total_size: int, budget: int) -> bool:
@@ -102,7 +183,11 @@ def budget_check(total_size: int, budget: int) -> bool:
     - Tolerance is 0: byte counts are compared exactly, with no headroom and
       no rounding.
     """
-    raise NotImplementedError
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+        return False
+    if total_size < 0 or budget < 0:
+        return False
+    return total_size <= budget
 
 
 def depth_check(entry: dict, max_depth: int) -> bool:
@@ -118,7 +203,11 @@ def depth_check(entry: dict, max_depth: int) -> bool:
       leaves and may be checked at ``max_depth == 0``.
     - Tolerance is 0: one extra archive layer is over the limit.
     """
-    raise NotImplementedError
+    if isinstance(max_depth, bool) or not isinstance(max_depth, (int, float)):
+        return False
+    if max_depth < 0:
+        return False
+    return _nested_depth(entry) <= max_depth
 
 
 def path_check(name: str, root: str) -> bool:
@@ -141,7 +230,36 @@ def path_check(name: str, root: str) -> bool:
     - Tolerance is 0: trailing separators or separators in a different style
       are normalized, but no other spelling differences are allowed.
     """
-    raise NotImplementedError
+    if not isinstance(name, str) or not isinstance(root, str):
+        return False
+    if not name or not root:
+        return False
+
+    # Separators in a different style name the same member.
+    normalized = name.replace("\\", "/")
+
+    # Drive-qualified forms (``C:\x``, ``C:x``) and UNC paths
+    # (``\\host\share``) are rejected on every host, not only Windows.
+    if ntpath.splitdrive(normalized)[0]:
+        return False
+    # Absolute POSIX paths (including ``//`` forms).
+    if normalized.startswith("/"):
+        return False
+
+    root_norm = os.path.normpath(root)
+    joined = os.path.normpath(os.path.join(root_norm, normalized))
+
+    root_case = os.path.normcase(root_norm)
+    joined_case = os.path.normcase(joined)
+
+    # The root itself and names that normalize to "." are not file members.
+    if joined_case == root_case:
+        return False
+    try:
+        common = os.path.commonpath((joined_case, root_case))
+    except ValueError:
+        return False
+    return common == root_case
 
 
 def extract_plan(archive: dict, policy: dict) -> dict:
@@ -185,7 +303,99 @@ def extract_plan(archive: dict, policy: dict) -> dict:
     - Tolerance is 0: one extra byte, entry, character, or nesting layer is
       over its limit, while equality passes.
     """
-    raise NotImplementedError
+    policy = policy or {}
+    reasons: list[str] = []
+
+    # Policy problems are copied verbatim and already reject the archive.
+    reasons.extend(validate_policy(policy))
+
+    root = policy.get("root")
+    if not root:
+        reasons.append("缺少目标根目录")
+
+    manifest = inspect(archive)
+
+    if manifest["size_mismatches"]:
+        reasons.append("声明大小与实际大小不一致")
+
+    if root:
+        for item in manifest["entries"]:
+            if not path_check(item["name"], root):
+                reasons.append("条目路径越界")
+                break
+
+    max_entries = policy.get("max_entries")
+    if max_entries is None:
+        max_entries = _DEFAULT_MAX_ENTRIES
+    if (
+        isinstance(max_entries, (int, float))
+        and not isinstance(max_entries, bool)
+        and manifest["entry_count"] > max_entries
+    ):
+        reasons.append("条目数超限")
+
+    max_name_length = policy.get("max_name_length")
+    if max_name_length is None:
+        max_name_length = _DEFAULT_MAX_NAME_LENGTH
+    if isinstance(max_name_length, (int, float)) and not isinstance(
+        max_name_length, bool
+    ):
+        for item in manifest["entries"]:
+            name = item["name"]
+            if isinstance(name, str) and len(name) > max_name_length:
+                reasons.append("文件名过长")
+                break
+
+    max_depth = policy.get("max_depth")
+    if (
+        isinstance(max_depth, (int, float))
+        and not isinstance(max_depth, bool)
+        and max_depth >= 0
+        and manifest["max_depth"] > max_depth
+    ):
+        reasons.append("嵌套深度超限")
+
+    max_ratio = policy.get("max_ratio")
+    if (
+        isinstance(max_ratio, (int, float))
+        and not isinstance(max_ratio, bool)
+        and max_ratio > 0
+        and not ratio_check(
+            manifest["total_size"], manifest["total_compressed"], max_ratio
+        )
+    ):
+        reasons.append("压缩比超限")
+
+    budget = policy.get("budget")
+    if (
+        isinstance(budget, (int, float))
+        and not isinstance(budget, bool)
+        and budget >= 0
+        and not budget_check(manifest["total_size"], budget)
+    ):
+        reasons.append("总量预算超限")
+
+    accepted = not reasons
+    entries = []
+    if accepted:
+        entries = [
+            {
+                "name": item["name"],
+                "size": item["size"],
+                "compressed_size": item["compressed_size"],
+            }
+            for item in manifest["entries"]
+        ]
+
+    return {
+        "accepted": accepted,
+        "reasons": reasons,
+        "entries": entries,
+        "entry_count": manifest["entry_count"],
+        "total_size": manifest["total_size"],
+        "total_compressed": manifest["total_compressed"],
+        "max_depth": manifest["max_depth"],
+    }
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -205,7 +415,37 @@ def validate_policy(policy: dict) -> list[str]:
     - Tolerance is 0: presence and positivity are checked strictly; a value
       of zero for ``max_ratio`` is not a valid unlimited ratio.
     """
-    raise NotImplementedError
+    policy = policy or {}
+    issues: list[str] = []
+
+    budget = policy.get("budget")
+    if (
+        budget is None
+        or isinstance(budget, bool)
+        or not isinstance(budget, (int, float))
+        or budget < 0
+    ):
+        issues.append("缺少总量预算")
+
+    max_ratio = policy.get("max_ratio")
+    if (
+        max_ratio is None
+        or isinstance(max_ratio, bool)
+        or not isinstance(max_ratio, (int, float))
+        or max_ratio <= 0
+    ):
+        issues.append("缺少压缩比上限")
+
+    max_depth = policy.get("max_depth")
+    if (
+        max_depth is None
+        or isinstance(max_depth, bool)
+        or not isinstance(max_depth, (int, float))
+        or max_depth < 0
+    ):
+        issues.append("缺少嵌套深度上限")
+
+    return issues
 
 
 def archive_batch(archives: dict, policy: dict) -> dict:
@@ -226,4 +466,12 @@ def archive_batch(archives: dict, policy: dict) -> dict:
     - Tolerance is 0: batch results must match calling :func:`extract_plan`
       separately for each archive with the same policy.
     """
-    raise NotImplementedError
+    plans = {}
+    for label, archive in (archives or {}).items():
+        # A fresh plan per archive: no manifest, total, depth, or reason is
+        # ever carried over from a previous archive.
+        plans[label] = extract_plan(archive, policy)
+    return {
+        "accepted": all(plan["accepted"] for plan in plans.values()),
+        "plans": plans,
+    }
